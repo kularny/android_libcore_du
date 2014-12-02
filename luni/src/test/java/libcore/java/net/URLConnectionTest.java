@@ -16,7 +16,8 @@
 
 package libcore.java.net;
 
-import com.android.okhttp.HttpResponseCache;
+import com.android.okhttp.AndroidShimResponseCache;
+
 import com.google.mockwebserver.MockResponse;
 import com.google.mockwebserver.MockWebServer;
 import com.google.mockwebserver.RecordedRequest;
@@ -84,7 +85,7 @@ import static com.google.mockwebserver.SocketPolicy.SHUTDOWN_OUTPUT_AT_END;
 public final class URLConnectionTest extends AbstractResourceLeakageDetectorTestCase {
 
     private MockWebServer server;
-    private HttpResponseCache cache;
+    private AndroidShimResponseCache cache;
     private String hostName;
 
     @Override protected void setUp() throws Exception {
@@ -674,7 +675,7 @@ public final class URLConnectionTest extends AbstractResourceLeakageDetectorTest
     private void initResponseCache() throws IOException {
         String tmp = System.getProperty("java.io.tmpdir");
         File cacheDir = new File(tmp, "HttpCache-" + UUID.randomUUID());
-        cache = new HttpResponseCache(cacheDir, Integer.MAX_VALUE);
+        cache = AndroidShimResponseCache.create(cacheDir, Integer.MAX_VALUE);
         ResponseCache.setDefault(cache);
     }
 
