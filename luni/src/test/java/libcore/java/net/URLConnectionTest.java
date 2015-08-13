@@ -16,7 +16,8 @@
 
 package libcore.java.net;
 
-import com.android.okhttp.HttpResponseCache;
+import com.android.okhttp.AndroidShimResponseCache;
+
 import com.google.mockwebserver.MockResponse;
 import com.google.mockwebserver.MockWebServer;
 import com.google.mockwebserver.RecordedRequest;
@@ -84,7 +85,7 @@ import static com.google.mockwebserver.SocketPolicy.SHUTDOWN_OUTPUT_AT_END;
 public final class URLConnectionTest extends AbstractResourceLeakageDetectorTestCase {
 
     private MockWebServer server;
-    private HttpResponseCache cache;
+    private AndroidShimResponseCache cache;
     private String hostName;
 
     @Override protected void setUp() throws Exception {
@@ -674,8 +675,141 @@ public final class URLConnectionTest extends AbstractResourceLeakageDetectorTest
     private void initResponseCache() throws IOException {
         String tmp = System.getProperty("java.io.tmpdir");
         File cacheDir = new File(tmp, "HttpCache-" + UUID.randomUUID());
-        cache = new HttpResponseCache(cacheDir, Integer.MAX_VALUE);
+        cache = AndroidShimResponseCache.create(cacheDir, Integer.MAX_VALUE);
         ResponseCache.setDefault(cache);
+    }
+
+    /**
+     * Test Etag headers are returned correctly when a client-side cache is not installed.
+     * https://code.google.com/p/android/issues/detail?id=108949
+     */
+    public void testEtagHeaders_uncached() throws Exception {
+        final String etagValue1 = "686897696a7c876b7e";
+        final String body1 = "Response with etag 1";
+        final String etagValue2 = "686897696a7c876b7f";
+        final String body2 = "Response with etag 2";
+
+        server.enqueue(
+            new MockResponse()
+                .setBody(body1)
+                .setHeader("Content-Type", "text/plain")
+                .setHeader("Etag", etagValue1));
+        server.enqueue(
+            new MockResponse()
+                .setBody(body2)
+                .setHeader("Content-Type", "text/plain")
+                .setHeader("Etag", etagValue2));
+        server.play();
+
+        URL url = server.getUrl("/");
+        HttpURLConnection connection1 = (HttpURLConnection) url.openConnection();
+        assertEquals(etagValue1, connection1.getHeaderField("Etag"));
+        assertContent(body1, connection1);
+        connection1.disconnect();
+
+        // Discard the server-side record of the request made.
+        server.takeRequest();
+
+        HttpURLConnection connection2 = (HttpURLConnection) url.openConnection();
+        assertEquals(etagValue2, connection2.getHeaderField("Etag"));
+        assertContent(body2, connection2);
+        connection2.disconnect();
+
+        // Check the client did not cache.
+        RecordedRequest request = server.takeRequest();
+        assertNull(request.getHeader("If-None-Match"));
+    }
+
+    /**
+     * Test Etag headers are returned correctly when a client-side cache is installed and the server
+     * data is unchanged.
+     * https://code.google.com/p/android/issues/detail?id=108949
+     */
+    public void testEtagHeaders_cachedWithServerHit() throws Exception {
+        final String etagValue = "686897696a7c876b7e";
+        final String body = "Response with etag";
+
+        server.enqueue(
+            new MockResponse()
+                .setBody(body)
+                .setResponseCode(HttpURLConnection.HTTP_OK)
+                .setHeader("Content-Type", "text/plain")
+                .setHeader("Etag", etagValue));
+
+        server.enqueue(
+            new MockResponse()
+                .setResponseCode(HttpURLConnection.HTTP_NOT_MODIFIED));
+        server.play();
+
+        initResponseCache();
+
+        URL url = server.getUrl("/");
+        HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+        assertEquals(etagValue, connection.getHeaderField("Etag"));
+        assertContent(body, connection);
+        connection.disconnect();
+
+        // Discard the server-side record of the request made.
+        server.takeRequest();
+
+        // Confirm the cached body is returned along with the original etag header.
+        HttpURLConnection cachedConnection = (HttpURLConnection) url.openConnection();
+        assertEquals(etagValue, cachedConnection.getHeaderField("Etag"));
+        assertContent(body, cachedConnection);
+        cachedConnection.disconnect();
+
+        // Check the client formatted the request correctly.
+        RecordedRequest request = server.takeRequest();
+        assertEquals(etagValue, request.getHeader("If-None-Match"));
+    }
+
+    /**
+     * Test Etag headers are returned correctly when a client-side cache is installed and the server
+     * data has changed.
+     * https://code.google.com/p/android/issues/detail?id=108949
+     */
+    public void testEtagHeaders_cachedWithServerMiss() throws Exception {
+        final String etagValue1 = "686897696a7c876b7e";
+        final String body1 = "Response with etag 1";
+        final String etagValue2 = "686897696a7c876b7f";
+        final String body2 = "Response with etag 2";
+
+        server.enqueue(
+            new MockResponse()
+                .setBody(body1)
+                .setResponseCode(HttpURLConnection.HTTP_OK)
+                .setHeader("Content-Type", "text/plain")
+                .setHeader("Etag", etagValue1));
+
+        server.enqueue(
+            new MockResponse()
+                .setBody(body2)
+                .setResponseCode(HttpURLConnection.HTTP_OK)
+                .setHeader("Content-Type", "text/plain")
+                .setHeader("Etag", etagValue2));
+
+        server.play();
+
+        initResponseCache();
+
+        URL url = server.getUrl("/");
+        HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+        assertEquals(etagValue1, connection.getHeaderField("Etag"));
+        assertContent(body1, connection);
+        connection.disconnect();
+
+        // Discard the server-side record of the request made.
+        server.takeRequest();
+
+        // Confirm the new body is returned along with the new etag header.
+        HttpURLConnection cachedConnection = (HttpURLConnection) url.openConnection();
+        assertEquals(etagValue2, cachedConnection.getHeaderField("Etag"));
+        assertContent(body2, cachedConnection);
+        cachedConnection.disconnect();
+
+        // Check the client formatted the request correctly.
+        RecordedRequest request = server.takeRequest();
+        assertEquals(etagValue1, request.getHeader("If-None-Match"));
     }
 
     /**
@@ -2214,23 +2348,74 @@ public final class URLConnectionTest extends AbstractResourceLeakageDetectorTest
 
         // Confirm the client fallback looks ok.
         List<SSLSocket> createdSockets = clientSocketFactory.getCreatedSockets();
-        assertEquals(2, createdSockets.size());
-        SSLSocket clientSocket1 = createdSockets.get(0);
-        List<String> clientSocket1EnabledProtocols = Arrays.asList(
-                clientSocket1.getEnabledProtocols());
-        assertContains(clientSocket1EnabledProtocols, "TLSv1.2");
-        List<String> clientSocket1EnabledCiphers =
-                Arrays.asList(clientSocket1.getEnabledCipherSuites());
-        assertContainsNoneMatching(
-                clientSocket1EnabledCiphers, StandardNames.CIPHER_SUITE_FALLBACK);
+        assertEquals(4, createdSockets.size());
+        TlsFallbackDisabledScsvSSLSocket clientSocket1 =
+                (TlsFallbackDisabledScsvSSLSocket) createdSockets.get(0);
+        assertSslSocket(clientSocket1,
+                false /* expectedWasFallbackScsvSet */, "TLSv1.2", "TLSv1.1", "TLSv1", "SSLv3");
 
-        SSLSocket clientSocket2 = createdSockets.get(1);
-        List<String> clientSocket2EnabledProtocols =
-                Arrays.asList(clientSocket2.getEnabledProtocols());
-        assertContainsNoneMatching(clientSocket2EnabledProtocols, "TLSv1.2");
-        List<String> clientSocket2EnabledCiphers =
-                Arrays.asList(clientSocket2.getEnabledCipherSuites());
-        assertContains(clientSocket2EnabledCiphers, StandardNames.CIPHER_SUITE_FALLBACK);
+        TlsFallbackDisabledScsvSSLSocket clientSocket2 =
+                (TlsFallbackDisabledScsvSSLSocket) createdSockets.get(1);
+        assertSslSocket(clientSocket2,
+                true /* expectedWasFallbackScsvSet */, "TLSv1.1", "TLSv1", "SSLv3");
+
+        TlsFallbackDisabledScsvSSLSocket clientSocket3 =
+                (TlsFallbackDisabledScsvSSLSocket) createdSockets.get(2);
+        assertSslSocket(clientSocket3, true /* expectedWasFallbackScsvSet */, "TLSv1", "SSLv3");
+
+        TlsFallbackDisabledScsvSSLSocket clientSocket4 =
+                (TlsFallbackDisabledScsvSSLSocket) createdSockets.get(3);
+        assertSslSocket(clientSocket4, true /* expectedWasFallbackScsvSet */, "SSLv3");
+    }
+
+    public void testSslFallback_defaultProtocols() throws Exception {
+        TestSSLContext testSSLContext = TestSSLContext.create();
+
+        server.useHttps(testSSLContext.serverContext.getSocketFactory(), false);
+        server.enqueue(new MockResponse().setSocketPolicy(FAIL_HANDSHAKE));
+        server.enqueue(new MockResponse().setSocketPolicy(FAIL_HANDSHAKE));
+        server.enqueue(new MockResponse().setBody("This required fallbacks"));
+        server.play();
+
+        HttpsURLConnection connection = (HttpsURLConnection) server.getUrl("/").openConnection();
+        // Keeps track of the client sockets created so that we can interrogate them.
+        final boolean disableFallbackScsv = true;
+        FallbackTestClientSocketFactory clientSocketFactory = new FallbackTestClientSocketFactory(
+                testSSLContext.clientContext.getSocketFactory(),
+                disableFallbackScsv);
+        connection.setSSLSocketFactory(clientSocketFactory);
+        assertEquals("This required fallbacks",
+                readAscii(connection.getInputStream(), Integer.MAX_VALUE));
+
+        // Confirm the server accepted a single connection.
+        RecordedRequest retry = server.takeRequest();
+        assertEquals(0, retry.getSequenceNumber());
+        assertEquals("TLSv1", retry.getSslProtocol());
+
+        // Confirm the client fallback looks ok.
+        List<SSLSocket> createdSockets = clientSocketFactory.getCreatedSockets();
+        assertEquals(3, createdSockets.size());
+        TlsFallbackDisabledScsvSSLSocket clientSocket1 =
+                (TlsFallbackDisabledScsvSSLSocket) createdSockets.get(0);
+        assertSslSocket(clientSocket1,
+                false /* expectedWasFallbackScsvSet */, "TLSv1.2", "TLSv1.1", "TLSv1");
+
+        TlsFallbackDisabledScsvSSLSocket clientSocket2 =
+                (TlsFallbackDisabledScsvSSLSocket) createdSockets.get(1);
+        assertSslSocket(clientSocket2, true /* expectedWasFallbackScsvSet */, "TLSv1.1", "TLSv1");
+
+        TlsFallbackDisabledScsvSSLSocket clientSocket3 =
+                (TlsFallbackDisabledScsvSSLSocket) createdSockets.get(2);
+        assertSslSocket(clientSocket3, true /* expectedWasFallbackScsvSet */, "TLSv1");
+    }
+
+    private static void assertSslSocket(TlsFallbackDisabledScsvSSLSocket socket,
+            boolean expectedWasFallbackScsvSet, String... expectedEnabledProtocols) {
+        Set<String> enabledProtocols =
+                new HashSet<String>(Arrays.asList(socket.getEnabledProtocols()));
+        Set<String> expectedProtocolsSet = new HashSet<String>(Arrays.asList(expectedEnabledProtocols));
+        assertEquals(expectedProtocolsSet, enabledProtocols);
+        assertEquals(expectedWasFallbackScsvSet, socket.wasTlsFallbackScsvSet());
     }
 
     public void testInspectSslBeforeConnect() throws Exception {
